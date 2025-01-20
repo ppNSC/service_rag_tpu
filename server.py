@@ -1,6 +1,8 @@
 import os
 from pydantic import BaseModel
+import re
 import shutil
+import time
 
 import faiss
 from fastapi import FastAPI, File, UploadFile 
@@ -44,7 +46,7 @@ class RAG_SERVER:
     _initialized = False
     UPLOAD_PATH = './knowledge_base/uploaded_file'
     DATABASE_PATH =  './knowledge_base/vector_database'
-    FILE_RECORDS_LAST_USED_DB = './knowledge_base/id_last_used.txt'
+    FILE_RECORDS_LAST_USED_DB = './knowledge_base/cur_knowledge_used.txt'
     SUPPORTED_EXT = ["pdf", "txt", "docx", "pptx", 'png', 'jpg', 'jpeg', 'bmp']
     def __init__(self) -> None:
         if not RAG_SERVER._initialized:
@@ -52,13 +54,13 @@ class RAG_SERVER:
             self.cur_file_unique_id = None
             self.cur_vector_db = None
             self.cur_string_db = None
+            self.model_status = 0
             if os.path.isfile(RAG_SERVER.FILE_RECORDS_LAST_USED_DB):
                 with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'r') as record_id:
                     last_used_id = record_id.read().strip()
                     exist_knowledge_database = RAG_SERVER.get_vector_database_map()
                     if last_used_id in exist_knowledge_database.keys():
                         self.select_vector_database_to_use(last_used_id, exist_knowledge_database[last_used_id])
-            self.model_status = 0
             try:
                 self.embedding_machine = Word2VecEmbedding()
                 self.reranker = RerankerTPU()
@@ -118,6 +120,9 @@ class RAG_SERVER:
             with open(os.path.join(RAG_SERVER.DATABASE_PATH, self.cur_file_unique_id, "name.txt"), "w", encoding="utf-8") as file:
                 file.write(self.cur_file_name)
             self.model_status = last_model_status 
+            if os.path.isfile(RAG_SERVER.FILE_RECORDS_LAST_USED_DB):
+                with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'w', encoding="utf-8") as file:
+                    file.write(self.cur_file_unique_id)
             status = True
         except:
             if os.path.exists(os.path.join(RAG_SERVER.DATABASE_PATH, self.cur_file_unique_id)):
@@ -136,8 +141,9 @@ class RAG_SERVER:
         with open(os.path.join(RAG_SERVER.DATABASE_PATH, unique_id, 'db.string'), "rb") as file:
             byte_stream = file.read()
         self.cur_string_db = pickle.loads(byte_stream)
-        with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'w', encoding="utf-8") as file:
-            file.write(self.cur_file_unique_id)
+        if os.path.isfile(RAG_SERVER.FILE_RECORDS_LAST_USED_DB):
+            with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'w', encoding="utf-8") as file:
+                file.write(self.cur_file_unique_id)
         return True
 
     def del_vector_database_for_file(self, unique_id: str, file_name: str):
@@ -146,6 +152,9 @@ class RAG_SERVER:
             self.cur_file_unique_id = None
             self.cur_string_db = None
             self.cur_vector_db = None
+            if os.path.isfile(RAG_SERVER.FILE_RECORDS_LAST_USED_DB):
+                with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'w', encoding="utf-8") as file:
+                    file.write("")
         if os.path.exists(os.path.join(RAG_SERVER.UPLOAD_PATH, unique_id, file_name)):
             shutil.rmtree(os.path.join(RAG_SERVER.UPLOAD_PATH, unique_id))
         if os.path.exists(os.path.join(RAG_SERVER.DATABASE_PATH, unique_id)):
@@ -294,24 +303,29 @@ async def prompt_retrieval(request: PromptRetrievalRequest):
         return JSONResponse(content={
             "code": 1,
             "message": "messageType is illegal",
+            "retrieval_snippets": []
         })
     rag_server = RAG_SERVER()
     if rag_server.cur_file_unique_id is None:
         return JSONResponse(content={
             "code": 2,
             "message": "No knowledge is selected",
+            "retrieval_snippets": []
         })
     try:
+        while rag_server.model_status == 2:
+            time.sleep(3)
         retrieval_snippets = rag_server.retrieval_from_vector_db(request.prompt)
         reranker_snippets = rag_server.reranker.compress_documents(retrieval_snippets, request.prompt, request.snippet_num)
     except:
         return JSONResponse(content={
             "code": 3,
             "message": "There was a problem during retrieval",
-            "retrieval_snippets": ""
+            "retrieval_snippets": []
         }) 
 
-    reference = [ x.page_content for x in reranker_snippets ]
+    reference = [ {"text": re.sub(r'[^\x20-\x7E\u4E00-\u9FFF]+','',x.page_content), "score":round(x.metadata['relevance_score'].item(), 2)} for x in reranker_snippets ]
+    # reference = [ {"text": x.page_content.encode('utf-8', 'ignore').decode('utf-8'), "score":round(x.metadata['relevance_score'].item(), 2)} for x in reranker_snippets ]
     return JSONResponse(content={
         "code": 0,
         "message": "",
@@ -320,7 +334,7 @@ async def prompt_retrieval(request: PromptRetrievalRequest):
 
 @app.post("/status")
 async def query_status():
-    if RAG_SERVER._instance is None:
+    if RAG_SERVER().model_status == -1:
         return JSONResponse(content={
             "code": 1,
             "message": "RAG service did not start properly",
