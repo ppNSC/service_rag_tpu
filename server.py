@@ -125,12 +125,11 @@ class RAG_SERVER:
                     file.write(self.cur_file_unique_id)
             status = True
         except:
-            if os.path.exists(os.path.join(RAG_SERVER.DATABASE_PATH, self.cur_file_unique_id)):
-                shutil.rmtree(os.path.join(RAG_SERVER.DATABASE_PATH, self.cur_file_unique_id))
             self.cur_file_unique_id = last_file_unique_id
             self.cur_file_name = last_file_name
             self.cur_string_db = last_string_db
             self.cur_vector_db = last_vector_db
+            self.del_vector_database_for_file(file_path.split("/")[-2], file_path.split("/")[-1])
             status = False
         return status
     
@@ -217,9 +216,7 @@ async def add_knowledge(file: UploadFile = File(...)):
         })
 
     # 给上传的文件生成对应的向量数据库文件
-    try:
-        rag_server.add_vector_database_for_file(file_path)
-    except:
+    if rag_server.add_vector_database_for_file(file_path) is False:
         # 如果生成向量数据库失败，删除对应的文件
         if os.path.exists(os.path.join(RAG_SERVER.UPLOAD_PATH, unique_id)):
             shutil.rmtree(os.path.join(RAG_SERVER.UPLOAD_PATH, unique_id)) 
