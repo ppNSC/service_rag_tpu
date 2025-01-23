@@ -5,6 +5,9 @@ import os
 from pydantic import BaseModel
 import re
 import shutil
+import sys
+import threading
+import time
 
 import faiss
 from fastapi import FastAPI, File, UploadFile 
@@ -21,6 +24,7 @@ nltk.download('punkt_tab', download_dir=nltk_data_path)
 nltk.download('averaged_perceptron_tagger_eng', download_dir=nltk_data_path)
 nltk.data.path.append(nltk_data_path)
 
+import SILK2.Tools.logger as Logger
 from doc_processor.knowledge_file import KnowledgeFile
 from embedding import Word2VecEmbedding
 from reranker import RerankerTPU
@@ -37,10 +41,9 @@ class PromptRetrievalRequest(BaseModel):
 
 app = FastAPI()
 
-
 class RAG_SERVER:
-    _instance = None
-    _initialized = False
+    _singleton = None
+    _config_initialized = False
 
     class ServiceStatus(Enum):
         SERVICE_NOT_STARED = -1
@@ -54,48 +57,113 @@ class RAG_SERVER:
         SERVICE_RETRIEVING = 7
 
     STATUS_LOCK = asyncio.Lock()
-    SERVICE_STATUS = -1
 
     UPLOAD_PATH = './knowledge_base/uploaded_file'
     DATABASE_PATH =  './knowledge_base/vector_database'
     FILE_RECORDS_LAST_USED_DB = './knowledge_base/cur_knowledge_used.txt'
     SUPPORTED_EXT = ["pdf", "txt", "docx", "pptx", 'png', 'jpg', 'jpeg', 'bmp']
-    def __init__(self, args = None) -> None:
-        if not RAG_SERVER._initialized:
-            RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_PREPARING
-            self.cur_file_name = None
-            self.cur_file_unique_id = None
-            self.cur_vector_db = None
-            self.cur_string_db = None
-            try:
-                if os.path.isfile(RAG_SERVER.FILE_RECORDS_LAST_USED_DB):
-                    with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'r') as record_id:
-                        last_used_id = record_id.read().strip()
-                        exist_knowledge_database = RAG_SERVER.get_vector_database_map()
-                        if last_used_id in exist_knowledge_database.keys():
-                            self.select_vector_database_to_use(last_used_id, exist_knowledge_database[last_used_id])
-            except:
-                pass
-            try:
-                self.embedding_machine = Word2VecEmbedding(args.embedding_model_path,
-                                                           args.embedding_model_tokenizer_path,
-                                                           256,
-                                                           args.embedding_model_devid)
-                self.reranker_machine = RerankerTPU(args.reranker_model_path,
-                                            args.reranker_model_tokenizer_path,
-                                            args.reranker_model_devid)
-            except:
-                RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_NOT_STARED
-                return
 
-            RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_READY
-            RAG_SERVER._initialized = True
+    def __init__(self, args = None) -> None:
+        # config
+        if not RAG_SERVER._config_initialized:
+            RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_NOT_STARED
+
+            self.logger = Logger.Log("RAG_SERVER", args.log_level)
+            self.logger.info(f"{Logger.file_lineno()} 日志系统启动，当前设置为:"+args.log_level)  
+            self.logger.info(f"{Logger.file_lineno()} 当前embedding模型为:"+args.embedding_model_name)
+            self.logger.info(f"{Logger.file_lineno()} 当前reranker模型为:"+args.reranker_model_name)
+
+            self.embedding_model_paths = {
+                'BM1688_bce_base_v1': "./models/BM1688/bce_embedding/bce-embedding-base_v1.bmodel",
+                'BM1688_bce_base_v1_tokenizer': "./models/BM1688/bce_embedding/token_config",
+                'BM1684X_bce_base_v1': "./models/BM1684X/bce_embedding/bce-embedding-base_v1.bmodel",
+                'BM1684X_bce_base_v1_tokenizer': "./models/BM1684X/bce_embedding/token_config"
+            }
+            self.reranker_model_paths = {
+                'BM1688_bce_base_v1': "./models/BM1688/bce_reranker/bce-reranker-base_v1.bmodel",
+                'BM1688_bce_base_v1_tokenizer': "./models/BM1688/bce_reranker/token_config",
+                'BM1684X_bce_base_v1': "./models/BM1684X/bce_reranker/bce-reranker-base_v1.bmodel",
+                'BM1684X_bce_base_v1_tokenizer': "./models/BM1684X/bce_reranker/token_config"
+            }
+            self.embedding_model_name = args.embedding_model_name
+            self.reranker_model_name = args.reranker_model_name
+            self.dev_id = args.dev_id
+            self.set_vector_db_empty()
+
+            RAG_SERVER._config_initialized = True
 
     def __new__(cls, *args, **kwargs):
-        # single instance
-        if cls._instance is None:
-            cls._instance = super(RAG_SERVER, cls).__new__(cls)
-        return cls._instance
+        if cls._singleton is None:
+            cls._singleton = super(RAG_SERVER, cls).__new__(cls)
+        return cls._singleton
+
+    def start_service(self,):
+        RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_PREPARING
+        # 获取并格式化当前时间，用于打印服务启动信息
+        self.logger.info(f"{Logger.file_lineno()} RAG服务启动，模型启动中...")   
+        self.logger.info(f"{Logger.file_lineno()} RAG模型状态:{RAG_SERVER.SERVICE_STATUS}，正在加载...")
+        import sophon.sail as sail
+        try:
+            self.target = sail.Handle(self.dev_id).get_target()#获取设备型号
+        except:
+            self.logger.error(f"{Logger.file_lineno()} 设备{self.dev_id}不存在!")
+            RAG_SERVER.SERVICE_STATUS= RAG_SERVER.ServiceStatus.SERVICE_NOT_STARED #模型加载失败
+            sys.exit(1)
+        try:
+            embedding_bmodel_path = self.embedding_model_paths[self.target+'_'+self.embedding_model_name]
+        except KeyError:
+            self.logger.error(f"{Logger.file_lineno()} 模型{self.embedding_model_name}不存在!")
+            RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_NOT_STARED #模型加载失败
+            sys.exit(1)
+        try:
+            reranker_bmodel_path = self.reranker_model_paths[self.target+'_'+self.reranker_model_name]
+        except KeyError:
+            self.logger.error(f"{Logger.file_lineno()} 模型{self.reranker_model_name}不存在!")
+            RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_NOT_STARED #模型加载失败
+            sys.exit(1)
+
+        curr_path = os.path.dirname(os.path.abspath(__file__))
+        embedding_model_tokenizer_path = self.embedding_model_paths[self.target+'_'+self.embedding_model_name+'_tokenizer']
+        embedding_model_tokenizer_path = os.path.abspath(os.path.join(curr_path, embedding_model_tokenizer_path))
+        embedding_bmodel_path = os.path.abspath(os.path.join(curr_path, embedding_bmodel_path))
+        reranker_model_tokenizer_path = self.reranker_model_paths[self.target+'_'+self.reranker_model_name+'_tokenizer']
+        reranker_model_tokenizer_path = os.path.abspath(os.path.join(curr_path, reranker_model_tokenizer_path))
+        reranker_bmodel_path = os.path.abspath(os.path.join(curr_path, reranker_bmodel_path))
+        try:
+            self.embedding_machine = Word2VecEmbedding(embedding_bmodel_path,
+                                                       embedding_model_tokenizer_path,
+                                                       256,
+                                                       self.dev_id)
+        except:
+            RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_NOT_STARED
+            self.logger.info(f"{Logger.file_lineno()} RAG模型状态:{RAG_SERVER.SERVICE_STATUS},embedding模型加载失败.")
+            return False
+        self.logger.info(f"{Logger.file_lineno()} RAG模型状态:{RAG_SERVER.SERVICE_STATUS},embedding模型加载完成.")
+        try:
+            self.reranker_machine = RerankerTPU(reranker_bmodel_path,
+                                                reranker_model_tokenizer_path,
+                                                self.dev_id)
+        except:
+            RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_NOT_STARED
+            self.logger.info(f"{Logger.file_lineno()} RAG模型状态:{RAG_SERVER.SERVICE_STATUS},reranker模型加载失败.")
+            return False
+        self.logger.info(f"{Logger.file_lineno()} RAG模型状态:{RAG_SERVER.SERVICE_STATUS},reranker模型加载完成.")
+
+        try:
+            # read knowledge id last used
+            if os.path.isfile(RAG_SERVER.FILE_RECORDS_LAST_USED_DB):
+                with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'r') as record_id:
+                    last_used_id = record_id.read().strip()
+                    exist_knowledge_database = RAG_SERVER.get_vector_database_map()
+                    if last_used_id in exist_knowledge_database.keys():
+                        self.select_vector_database_to_use(last_used_id, exist_knowledge_database[last_used_id])
+        except:
+            # if file recorded knowledge last used was deleted, set vector database to empty
+            self.logger.info(f"{Logger.file_lineno()} 未读取到上次退出前使用的知识库，当前使用的知识库设为空.")
+            self.set_vector_db_empty()
+
+        RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_READY
+        return True
 
     @staticmethod
     def get_service_status_string(status: ServiceStatus) -> str:
@@ -123,6 +191,12 @@ class RAG_SERVER:
                         pass
         return knowledge_map
 
+    def set_vector_db_empty(self):
+        self.cur_file_name = None
+        self.cur_file_unique_id = None
+        self.cur_vector_db = None
+        self.cur_string_db = None 
+
     def retrieval_from_vector_db(self, query: str):
         # current batch size of reranker model if 3.
         k = 3
@@ -134,8 +208,6 @@ class RAG_SERVER:
         return [self.cur_string_db[ind] for ind in i[0]]
 
     def add_vector_database_for_file(self, file_path: str):
-        import pdb
-        pdb.set_trace()
         last_file_unique_id = self.cur_file_unique_id
         last_file_name = self.cur_file_name
         last_string_db = self.cur_string_db
@@ -201,10 +273,7 @@ class RAG_SERVER:
     def del_vector_database_for_file(self, unique_id: str, file_name: str):
         try:
             if self.cur_file_unique_id == unique_id:
-                self.cur_file_name = None
-                self.cur_file_unique_id = None
-                self.cur_string_db = None
-                self.cur_vector_db = None
+                self.set_vector_db_empty()
                 with open(RAG_SERVER.FILE_RECORDS_LAST_USED_DB, 'w', encoding="utf-8") as file:
                     file.write("")
             if os.path.exists(os.path.join(RAG_SERVER.UPLOAD_PATH, unique_id, file_name)):
@@ -351,7 +420,6 @@ async def query_cur_knowledge():
         "fileName": file_name
     })
 
-
 @app.post("/mod_knowledge_used")
 async def modify_knowledge_used(request: SelectKnowledgeRequest):
     async with RAG_SERVER.STATUS_LOCK:
@@ -447,8 +515,10 @@ async def prompt_retrieval(request: PromptRetrievalRequest):
             "retrieval_snippets": []
         }) 
 
+    # only remains ASCII and Unicode
     reference = [ {"text": re.sub(r'[^\x20-\x7E\u4E00-\u9FFF]+','',x.page_content), "score":round(x.metadata['relevance_score'].item(), 2)} for x in reranker_snippets ]
     # reference = [ {"text": x.page_content.encode('utf-8', 'ignore').decode('utf-8'), "score":round(x.metadata['relevance_score'].item(), 2)} for x in reranker_snippets ]
+
     RAG_SERVER.SERVICE_STATUS = RAG_SERVER.ServiceStatus.SERVICE_READY
     return JSONResponse(content={
         "code": 0,
@@ -466,20 +536,29 @@ async def query_status():
         "status": status
     })
 
+def is_running(pid_file):
+    """检查是否有其他实例在运行"""
+    if os.path.exists(pid_file):
+        with open(pid_file, 'r') as f:
+            pid = int(f.read().strip())
+            try:
+                # 检查进程是否存在
+                os.kill(pid, 0)
+                return True  # 进程仍在运行
+            except OSError:
+                return False  # 进程不存在
+    return False
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # embedding model path
-    parser.add_argument("--embedding_model_path", type=str, default="./models/BM1684X/bce_embedding/bce-embedding-base_v1.bmodel", help="embedding bmodel path")
-    # embedding model tokenizer path
-    parser.add_argument("--embedding_model_tokenizer_path", type=str, default="./models/BM1684X/bce_embedding/token_config", help="embedding tokenizer path")
-    # embedding model dev_id
-    parser.add_argument("--embedding_model_devid", type=int, default=5, help="which TPU to load embedding model")
-    # reranker model path
-    parser.add_argument("--reranker_model_path", type=str, default="./models/BM1684X/bce_reranker/bce-reranker-base_v1.bmodel", help="reranker bmodel path")
-    # reranker model tokenizer path
-    parser.add_argument("--reranker_model_tokenizer_path", type=str, default="./models/BM1684X/bce_reranker/token_config", help="reranker tokenizer path")
-    # reranker model dev_id
-    parser.add_argument("--reranker_model_devid", type=int, default=5, help="which TPU to load reranker model")
+    parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        help='日志等级,目前的等级有4个,从低到高依次是DEBUG、INFO、WARNING、ERROR,默认是INFO')
+    # embedding model name
+    parser.add_argument("--embedding_model_name", type=str, default="bce_base_v1", help="embedding model name")
+    # reranker model name
+    parser.add_argument("--reranker_model_name", type=str, default="bce_base_v1", help="reranker model name")
+    # dev_id
+    parser.add_argument("--dev_id", type=int, default=5, help="which TPU to load BModel")
     try:
         args = parser.parse_args()
     except SystemExit as e:
@@ -488,6 +567,26 @@ if __name__ == "__main__":
         # so we have to do a hard exit.
         os._exit(e.code)
 
-    rag_server = RAG_SERVER(args)
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=18084)
+    pid_file_path = '/tmp/arg_service.pid'
+    if is_running(pid_file_path):
+        current_time = time.localtime()
+        formatted_time = time.strftime("%Y%m%d-%H:%M:%S", current_time)
+        print(formatted_time,": RAG 服务已经在运行。")
+        sys.exit(1)
+
+    # 写入当前进程的 PID
+    with open(pid_file_path, 'w') as f:
+        f.write(str(os.getpid()))
+
+    try:
+        rag_server = RAG_SERVER(args)
+        thread = threading.Thread(target=rag_server.start_service)
+        thread.daemon = True
+        thread.start()
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=18084)
+    except KeyboardInterrupt:
+        print("RAG 服务被中断。")
+    finally:
+        # 删除 PID 文件
+        os.remove(pid_file_path)
